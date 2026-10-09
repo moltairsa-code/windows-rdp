@@ -1,0 +1,209 @@
+name: Windows RDP (auto-loop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Runtime in minutes (max 340)"
+        required: false
+        default: "330"
+      test_mode:
+        description: "Test run (5 min, no loop)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: rdp-singleton
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      RDP_USER: rdpuser
+      TS_HOSTNAME: bullet
+      MIGRATION: C:\Migration
+      STATE_REPO: moltairsa-code/rdp-state
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore state (files + Tailscale identity)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path $env:MIGRATION | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\ProgramData\Tailscale" | Out-Null
+          $tmp = Join-Path $env:RUNNER_TEMP "state"
+          git clone --depth 1 "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $tmp 2>&1 | Out-Host
+          if (Test-Path (Join-Path $tmp "state.zip")) {
+            $ex = Join-Path $env:RUNNER_TEMP "extract"
+            Expand-Archive -Path (Join-Path $tmp "state.zip") -DestinationPath $ex -Force
+            if (Test-Path (Join-Path $ex "migration")) {
+              Copy-Item (Join-Path $ex "migration\*") $env:MIGRATION -Recurse -Force
+              Write-Host "Saved files restored to $env:MIGRATION."
+            }
+            if (Test-Path (Join-Path $ex "tailscale")) {
+              Copy-Item (Join-Path $ex "tailscale\*") "C:\ProgramData\Tailscale" -Recurse -Force
+              Write-Host "Tailscale identity restored."
+            }
+          } else {
+            Write-Host "No prior state - fresh machine."
+          }
+
+      - name: Install & connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $dst = Join-Path $env:TEMP "tailscale-setup.exe"
+            Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $dst -UseBasicParsing
+            Start-Process $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & $exe up --authkey "$env:TS_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 3
+          Write-Host "Tailscale IP: $(& $exe ip -4 | Select-Object -First 1)"
+
+      - name: Enable RDP
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $u = $env:RDP_USER
+          $sec = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "RDP enabled for $u"
+
+      - name: Run startup script from Migration (if present)
+        run: |
+          $s = Join-Path $env:MIGRATION "startup.ps1"
+          if (Test-Path $s) {
+            Write-Host "Running Migration\startup.ps1 ..."
+            powershell -ExecutionPolicy Bypass -File $s
+          } else {
+            Write-Host "No startup.ps1 in Migration."
+          }
+
+      - name: Notify Telegram + keep alive + countdown
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          IN_RUNTIME: ${{ inputs.runtime_minutes }}
+          IN_TEST: ${{ inputs.test_mode }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          function Tg($text) {
+            try {
+              Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" `
+                -Body @{ chat_id = $env:TG_CHAT; text = $text } | Out-Null
+            } catch { Write-Host "Tg failed: $_" }
+          }
+
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = & $exe ip -4 | Select-Object -First 1
+          $dns = ((& $exe status --json | ConvertFrom-Json).Self.DNSName).TrimEnd('.')
+
+          $runtime = [int]$env:IN_RUNTIME
+          if ("$env:IN_TEST" -eq "true") { $runtime = 5 }
+          if ($runtime -gt 340) { $runtime = 340 }
+          if ($runtime -lt 5) { $runtime = 330 }
+
+          $nl = [Environment]::NewLine
+          $msg = "RDP is UP and running$nl" +
+                 "Host: $dns$nl" +
+                 "IP:   $ip$nl" +
+                 "User: $env:RDP_USER$nl" +
+                 "Pass: $env:RDP_PASSWORD$nl" +
+                 "Runtime: $runtime min$nl" +
+                 "Files persist to C:\Migration across restarts."
+          Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" -Body @{ chat_id = $env:TG_CHAT; text = $msg } | Out-Null
+          Write-Host $msg
+
+          $end = (Get-Date).AddMinutes($runtime)
+
+          $wd = Join-Path $env:RUNNER_TEMP "status"
+          Remove-Item $wd -Recurse -Force -ErrorAction SilentlyContinue
+          git clone --depth 1 "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $wd 2>&1 | Out-Host
+          if (Test-Path $wd) {
+            $endEpoch = [int][double]::Parse((Get-Date -Date $end.ToUniversalTime() -UFormat %s))
+            @{ host = $dns; ip = $ip; user = $env:RDP_USER; started = (Get-Date).ToUniversalTime().ToString("o"); end_epoch = $endEpoch; runtime_min = $runtime } |
+              ConvertTo-Json | Set-Content (Join-Path $wd "alive.json")
+            git -C $wd config user.email "github-actions[bot]@users.noreply.github.com"
+            git -C $wd config user.name "github-actions[bot]"
+            git -C $wd add alive.json
+            git -C $wd commit -m "alive $(Get-Date -Format o)" 2>&1 | Out-Host
+            git -C $wd push 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0) { git -C $wd pull --rebase 2>&1 | Out-Host; git -C $wd push 2>&1 | Out-Host }
+            Write-Host "alive.json published."
+          }
+
+          $nextTick = (Get-Date).AddMinutes(60)
+          while ((Get-Date) -lt $end) {
+            if ((Get-Date) -ge $nextTick) {
+              $left = [int][math]::Ceiling(($end - (Get-Date)).TotalMinutes)
+              Tg "Clock: RDP box has $left min left"
+              $nextTick = (Get-Date).AddMinutes(60)
+            }
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Save state (files + Tailscale identity)
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $stage = Join-Path $env:RUNNER_TEMP "stage"
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$stage\migration" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\tailscale" | Out-Null
+          Copy-Item "$env:MIGRATION\*" "$stage\migration" -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "C:\ProgramData\Tailscale\*" "$stage\tailscale" -Recurse -Force -ErrorAction SilentlyContinue
+          $zip = Join-Path $env:RUNNER_TEMP "state.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Write-Host "State size: $([math]::Round((Get-Item $zip).Length/1MB,2)) MB"
+
+          $wd = Join-Path $env:RUNNER_TEMP "push"
+          Remove-Item $wd -Recurse -Force -ErrorAction SilentlyContinue
+          git clone "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $wd 2>&1 | Out-Host
+          Copy-Item $zip (Join-Path $wd "state.zip") -Force
+          git -C $wd config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C $wd config user.name "github-actions[bot]"
+          git -C $wd add -A
+          git -C $wd commit -m "state $(Get-Date -Format o)" 2>&1 | Out-Host
+          git -C $wd push 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { git -C $wd pull --rebase 2>&1 | Out-Host; git -C $wd push 2>&1 | Out-Host }
+          Write-Host "State saved to $env:STATE_REPO."
+
+      - name: Trigger next machine (loop)
+        if: ${{ always() && inputs.test_mode != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run rdp.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f runtime_minutes="${{ inputs.runtime_minutes }}" -f test_mode=false
+          Write-Host "Next machine dispatched."

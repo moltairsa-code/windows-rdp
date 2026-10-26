@@ -20,7 +20,7 @@ environment:
 
 install:
   - ps: |
-      $ErrorActionPreference = "Stop"
+      $ErrorActionPreference = "Continue"
       foreach ($n in "GH_PAT","TAILSCALE_AUTHKEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","RDP_PASSWORD") {
         if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($n))) {
           throw "Required secret $n is empty. Check AppVeyor project environment variables."
@@ -34,7 +34,8 @@ install:
       $tmp = Join-Path $env:TEMP "state"
       Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
       git clone --depth 1 "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $tmp 2>&1 | Out-Host
-      if ((Test-Path (Join-Path $tmp "state.zip")) -and (Test-Path (Join-Path $tmp ".git"))) {
+      if (-not (Test-Path (Join-Path $tmp ".git"))) { throw "State repo clone failed (check GH_PAT / STATE_REPO)" }
+      if (Test-Path (Join-Path $tmp "state.zip")) {
         $ex = Join-Path $env:TEMP "extract"
         Remove-Item $ex -Recurse -Force -ErrorAction SilentlyContinue
         Expand-Archive -Path (Join-Path $tmp "state.zip") -DestinationPath $ex -Force
@@ -48,12 +49,14 @@ install:
       if (-not (Test-Path $exe)) {
         $dst = Join-Path $env:TEMP "tailscale-setup.exe"
         Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $dst -UseBasicParsing
+        if (-not (Test-Path $dst)) { throw "Tailscale installer download failed" }
         Start-Process $dst -ArgumentList "/quiet" -Wait
       }
+      if (-not (Test-Path $exe)) { throw "Tailscale not installed" }
       Set-Service Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
       Start-Service Tailscale -ErrorAction SilentlyContinue
       Start-Sleep -Seconds 8
-      & $exe up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$env:TS_HOSTNAME" "--accept-routes" "--accept-dns=false"
+      & $exe up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$env:TS_HOSTNAME" "--accept-routes" "--accept-dns=false" 2>&1 | Out-Host
       if ($LASTEXITCODE -ne 0) { throw "tailscale up failed with exit code $LASTEXITCODE" }
       $ips = @(& $exe ip -4)
       if (-not $ips -or $ips[0] -like "no current*") { throw "Tailscale did not get an IP: $ips" }
@@ -71,6 +74,7 @@ install:
         Set-LocalUser -Name $u -Password $sec
         Enable-LocalUser -Name $u
       }
+      if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) { throw "RDP user $u was not created" }
       Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
       Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
       New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null

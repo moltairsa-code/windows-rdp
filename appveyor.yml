@@ -1,14 +1,14 @@
 version: '{build}'
-image: Visual Studio 2026
+image: vs2026-ws2022
 clone_depth: 1
 max_jobs: 1
 branches:
   only:
     - main
 
-# Secrets — set in AppVeyor > Project > Settings > Environment (mark each "secure"/locked):
+# Secrets — set in AppVeyor > Project > Settings > Environment (secure/locked):
 #   GH_PAT, APPVEYOR_TOKEN, TAILSCALE_AUTHKEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RDP_PASSWORD
-# APPVEYOR_TOKEN is optional: without it, use an hourly scheduled build instead of self-trigger.
+# APPVEYOR_TOKEN is optional: without it, the box runs one cycle and stops.
 
 environment:
   RDP_USER: rdpuser
@@ -16,18 +16,25 @@ environment:
   MIGRATION: C:\Migration
   STATE_REPO: moltairsa-code/rdp-state-av
   RUN_MINUTES: '45'
+  READY_FLAG: C:\rdp_ready
 
 install:
   - ps: |
-      $ErrorActionPreference = "Continue"
+      $ErrorActionPreference = "Stop"
+      foreach ($n in "GH_PAT","TAILSCALE_AUTHKEY","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","RDP_PASSWORD") {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($n))) {
+          throw "Required secret $n is empty. Check AppVeyor project environment variables."
+        }
+      }
       New-Item -ItemType Directory -Force -Path $env:MIGRATION | Out-Null
       New-Item -ItemType Directory -Force -Path "C:\ProgramData\Tailscale" | Out-Null
+      Remove-Item $env:READY_FLAG -Force -ErrorAction SilentlyContinue
 
       # --- restore saved state ---
       $tmp = Join-Path $env:TEMP "state"
       Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
       git clone --depth 1 "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $tmp 2>&1 | Out-Host
-      if (Test-Path (Join-Path $tmp "state.zip")) {
+      if ((Test-Path (Join-Path $tmp "state.zip")) -and (Test-Path (Join-Path $tmp ".git"))) {
         $ex = Join-Path $env:TEMP "extract"
         Remove-Item $ex -Recurse -Force -ErrorAction SilentlyContinue
         Expand-Archive -Path (Join-Path $tmp "state.zip") -DestinationPath $ex -Force
@@ -43,14 +50,21 @@ install:
         Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $dst -UseBasicParsing
         Start-Process $dst -ArgumentList "/quiet" -Wait
       }
+      Set-Service Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
       Start-Service Tailscale -ErrorAction SilentlyContinue
-      & $exe up --authkey "$env:TAILSCALE_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+      Start-Sleep -Seconds 8
+      & $exe up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$env:TS_HOSTNAME" "--accept-routes" "--accept-dns=false"
+      if ($LASTEXITCODE -ne 0) { throw "tailscale up failed with exit code $LASTEXITCODE" }
+      $ips = @(& $exe ip -4)
+      if (-not $ips -or $ips[0] -like "no current*") { throw "Tailscale did not get an IP: $ips" }
+      Write-Host "Tailscale IP: $($ips[0])"
 
       # --- single RDP user + RDP enabled ---
       $u = $env:RDP_USER
       $sec = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
       if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
         New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+        Start-Sleep -Seconds 2
         Add-LocalGroupMember -Group "Administrators" -Member $u
         Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
       } else {
@@ -59,6 +73,7 @@ install:
       }
       Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
       Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+      New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null
       Write-Host "Tailscale + RDP ready."
 
 build_script:
@@ -78,6 +93,8 @@ build_script:
 on_finish:
   - ps: |
       $ErrorActionPreference = "Continue"
+      if (-not (Test-Path $env:READY_FLAG)) { Write-Host "Setup did not complete; not saving state or restarting."; return }
+      Remove-Item $env:READY_FLAG -Force -ErrorAction SilentlyContinue
 
       # --- save state ---
       $stage = Join-Path $env:TEMP "stage"
@@ -93,21 +110,23 @@ on_finish:
       $wd = Join-Path $env:TEMP "push"
       Remove-Item $wd -Recurse -Force -ErrorAction SilentlyContinue
       git clone "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $wd 2>&1 | Out-Host
-      Copy-Item $zip (Join-Path $wd "state.zip") -Force
-      git -C $wd config user.email "appveyor@users.noreply.github.com"
-      git -C $wd config user.name "appveyor"
-      git -C $wd add -A
-      git -C $wd commit -m "state $(Get-Date -Format o)" 2>&1 | Out-Host
-      git -C $wd push 2>&1 | Out-Host
-      if ($LASTEXITCODE -ne 0) { git -C $wd pull --rebase 2>&1 | Out-Host; git -C $wd push 2>&1 | Out-Host }
-      Write-Host "State saved."
+      if (Test-Path (Join-Path $wd ".git")) {
+        Copy-Item $zip (Join-Path $wd "state.zip") -Force
+        git -C $wd config user.email "appveyor@users.noreply.github.com"
+        git -C $wd config user.name "appveyor"
+        git -C $wd add -A
+        git -C $wd commit -m "state $(Get-Date -Format o)" 2>&1 | Out-Host
+        git -C $wd push 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) { git -C $wd pull --rebase 2>&1 | Out-Host; git -C $wd push 2>&1 | Out-Host }
+        Write-Host "State saved."
+      } else { Write-Host "State repo clone failed; skipping save." }
 
-      # --- auto-restart ---
+      # --- auto-restart (v2 token needs /api/account/{account} prefix) ---
       if ($env:APPVEYOR_TOKEN) {
-        $body = @{ accountName = $env:APPVEYOR_ACCOUNT_NAME; projectSlug = $env:APPVEYOR_PROJECT_SLUG; branch = $env:APPVEYOR_REPO_BRANCH } | ConvertTo-Json
+        $body = @{ accountName = $env:APPVEYOR_ACCOUNT_NAME; projectSlug = $env:APPVEYOR_PROJECT_SLUG; branch = "main" } | ConvertTo-Json
         $headers = @{ Authorization = "Bearer $env:APPVEYOR_TOKEN" }
         try {
-          Invoke-RestMethod -Method Post -Uri "https://ci.appveyor.com/api/builds" -Headers $headers -ContentType "application/json" -Body $body | Out-Null
+          Invoke-RestMethod -Method Post -Uri "https://ci.appveyor.com/api/account/$env:APPVEYOR_ACCOUNT_NAME/builds" -Headers $headers -ContentType "application/json" -Body $body | Out-Null
           Write-Host "Next build triggered."
         } catch { Write-Host "Trigger failed: $_" }
-      } else { Write-Host "APPVEYOR_TOKEN not set - relying on scheduled build." }
+      } else { Write-Host "APPVEYOR_TOKEN not set - not restarting." }

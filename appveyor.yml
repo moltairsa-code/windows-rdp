@@ -130,10 +130,16 @@ install:
       }
       Write-Host "Xray VLESS+WS on 127.0.0.1:8080$wspath"
 
-      # Funnel: first run may print a one-time approval URL for the tailnet owner.
-      $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
-      Write-Host $fout
-      $fout | Set-Content -Path (Join-Path $xdir "funnel.log") -Encoding UTF8
+      # Funnel: run detached. First run prints a one-time approval URL and may wait for it.
+      $fout = Join-Path $xdir "funnel.out.log"
+      $ferr = Join-Path $xdir "funnel.err.log"
+      Start-Process -FilePath $exe -ArgumentList "funnel","--bg","--yes","--https=443","localhost:8080" -WindowStyle Hidden -RedirectStandardOutput $fout -RedirectStandardError $ferr
+      Start-Sleep -Seconds 12
+      $ftext = ""
+      if (Test-Path $fout) { $ftext += (Get-Content $fout -Raw -ErrorAction SilentlyContinue) }
+      if (Test-Path $ferr) { $ftext += (Get-Content $ferr -Raw -ErrorAction SilentlyContinue) }
+      Write-Host $ftext
+      $ftext | Set-Content -Path (Join-Path $xdir "funnel.log") -Encoding ASCII
 
       New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null
       Write-Host "Tailscale + RDP + Xray ready."
@@ -157,9 +163,15 @@ build_script:
 
       $fstat = (& $exe funnel status --json 2>&1 | Out-String)
       if ($fstat -notmatch "8080") {
-        $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
-        Write-Host $fout
-        if ($fout -match "login\.tailscale\.com") { $msg += "$nl$nlFUNNEL APPROVAL NEEDED (open once):$nl$fout" }
+        $ftext = ""
+        foreach ($lf in @("funnel.out.log","funnel.err.log")) {
+          $lp = Join-Path $xdir $lf
+          if (Test-Path $lp) { $ftext += (Get-Content $lp -Raw -ErrorAction SilentlyContinue) }
+        }
+        if ($ftext -match "login\.tailscale\.com") { $msg += "$nl$nlFUNNEL APPROVAL NEEDED (open once):$nl$ftext" }
+        else {
+          Start-Process -FilePath $exe -ArgumentList "funnel","--bg","--yes","--https=443","localhost:8080" -WindowStyle Hidden -RedirectStandardOutput (Join-Path $xdir "funnel-retry.out.log") -RedirectStandardError (Join-Path $xdir "funnel-retry.err.log")
+        }
       }
 
       try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage" -Body @{ chat_id = $env:TELEGRAM_CHAT_ID; text = $msg } | Out-Null } catch {}
@@ -174,8 +186,14 @@ build_script:
           if ($fstat -match "8080") {
             if (-not $funnelLogged) { Write-Host "Funnel active: https://$dns"; $funnelLogged = $true }
           } else {
-            $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
-            if ($fout.Trim()) { Write-Host $fout }
+            $fout2 = Join-Path $xdir "funnel-retry-$i.out.log"
+            $ferr2 = Join-Path $xdir "funnel-retry-$i.err.log"
+            Start-Process -FilePath $exe -ArgumentList "funnel","--bg","--yes","--https=443","localhost:8080" -WindowStyle Hidden -RedirectStandardOutput $fout2 -RedirectStandardError $ferr2
+            Start-Sleep -Seconds 3
+            $ftext = ""
+            if (Test-Path $fout2) { $ftext += (Get-Content $fout2 -Raw -ErrorAction SilentlyContinue) }
+            if (Test-Path $ferr2) { $ftext += (Get-Content $ferr2 -Raw -ErrorAction SilentlyContinue) }
+            if ($ftext -match "login\.tailscale\.com") { Write-Host "FUNNEL APPROVAL NEEDED: $ftext" }
           }
         }
         $i++

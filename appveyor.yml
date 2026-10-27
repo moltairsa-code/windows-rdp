@@ -107,7 +107,8 @@ install:
         })
         outbounds = @(@{ protocol = "freedom" })
       }
-      $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $xdir "config.json") -Encoding UTF8
+      $json = $cfg | ConvertTo-Json -Depth 10
+      [System.IO.File]::WriteAllText((Join-Path $xdir "config.json"), $json, (New-Object System.Text.UTF8Encoding($false)))
 
       try { Unblock-File -Path $xray -ErrorAction SilentlyContinue } catch {}
       try { Add-MpPreference -ExclusionPath $xdir -ErrorAction SilentlyContinue } catch {}

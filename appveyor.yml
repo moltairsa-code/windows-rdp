@@ -109,10 +109,24 @@ install:
       }
       $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $xdir "config.json") -Encoding UTF8
 
+      try { Unblock-File -Path $xray -ErrorAction SilentlyContinue } catch {}
+      try { Add-MpPreference -ExclusionPath $xdir -ErrorAction SilentlyContinue } catch {}
+      $ver = (& $xray version 2>&1 | Out-String)
+      Write-Host "Xray version: $($ver.Trim())"
+
+      $stdout = Join-Path $xdir "xray.out.log"
+      $stderr = Join-Path $xdir "xray.err.log"
       Get-Process xray -ErrorAction SilentlyContinue | Stop-Process -Force
-      Start-Process -FilePath $xray -ArgumentList "run -c `"$(Join-Path $xdir 'config.json')`"" -WorkingDirectory $xdir -WindowStyle Hidden
+      $p = Start-Process -FilePath $xray -ArgumentList "run","-c",(Join-Path $xdir "config.json") -WorkingDirectory $xdir -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
       Start-Sleep -Seconds 3
-      if (-not (Get-Process xray -ErrorAction SilentlyContinue)) { throw "Xray did not start" }
+      $p.Refresh()
+      if ($p.HasExited) {
+        Write-Host "Xray exited with code $($p.ExitCode)"
+        Write-Host "--- xray stderr ---"; Get-Content $stderr -ErrorAction SilentlyContinue | Out-Host
+        Write-Host "--- xray stdout ---"; Get-Content $stdout -ErrorAction SilentlyContinue | Out-Host
+        Write-Host "--- config ---"; Get-Content (Join-Path $xdir "config.json") -ErrorAction SilentlyContinue | Out-Host
+        throw "Xray did not start"
+      }
       Write-Host "Xray VLESS+WS on 127.0.0.1:8080$wspath"
 
       # Funnel: first run may print a one-time approval URL for the tailnet owner.

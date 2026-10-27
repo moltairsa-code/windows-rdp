@@ -12,7 +12,7 @@ branches:
 
 environment:
   RDP_USER: rdpuser
-  TS_HOSTNAME: bullet-av
+  TS_HOSTNAME: bullet-av-1
   MIGRATION: C:\Migration
   STATE_REPO: moltairsa-code/rdp-state-av
   RUN_MINUTES: '45'
@@ -77,8 +77,51 @@ install:
       if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) { throw "RDP user $u was not created" }
       Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
       Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      # --- Xray VLESS+WS backend (public via Tailscale Funnel; TLS terminated by tailscaled) ---
+      $xdir = Join-Path $env:MIGRATION "xray"
+      New-Item -ItemType Directory -Force -Path $xdir | Out-Null
+      $xray = Join-Path $xdir "xray.exe"
+      if (-not (Test-Path $xray)) {
+        Write-Host "Downloading Xray-core..."
+        $zip = Join-Path $env:TEMP "xray.zip"
+        Invoke-WebRequest "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip" -OutFile $zip -UseBasicParsing
+        if (-not (Test-Path $zip)) { throw "Xray download failed" }
+        Expand-Archive -Path $zip -DestinationPath $xdir -Force
+      }
+      if (-not (Test-Path $xray)) { throw "Xray extract failed" }
+
+      $uuidFile = Join-Path $xdir "uuid.txt"
+      if (-not (Test-Path $uuidFile)) { [guid]::NewGuid().ToString() | Set-Content -Path $uuidFile -Encoding ASCII }
+      $uuid = (Get-Content $uuidFile -Raw).Trim()
+      $pathFile = Join-Path $xdir "wspath.txt"
+      if (-not (Test-Path $pathFile)) { ("/" + [guid]::NewGuid().ToString("N").Substring(0,12)) | Set-Content -Path $pathFile -Encoding ASCII }
+      $wspath = (Get-Content $pathFile -Raw).Trim()
+
+      $cfg = [ordered]@{
+        log = @{ loglevel = "warning" }
+        inbounds = @(@{
+          listen = "127.0.0.1"; port = 8080; protocol = "vless"
+          settings = @{ clients = @(@{ id = $uuid; email = "user" }); decryption = "none" }
+          streamSettings = @{ network = "ws"; wsSettings = @{ path = $wspath } }
+        })
+        outbounds = @(@{ protocol = "freedom" })
+      }
+      $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $xdir "config.json") -Encoding UTF8
+
+      Get-Process xray -ErrorAction SilentlyContinue | Stop-Process -Force
+      Start-Process -FilePath $xray -ArgumentList "run -c `"$(Join-Path $xdir 'config.json')`"" -WorkingDirectory $xdir -WindowStyle Hidden
+      Start-Sleep -Seconds 3
+      if (-not (Get-Process xray -ErrorAction SilentlyContinue)) { throw "Xray did not start" }
+      Write-Host "Xray VLESS+WS on 127.0.0.1:8080$wspath"
+
+      # Funnel: first run may print a one-time approval URL for the tailnet owner.
+      $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
+      Write-Host $fout
+      $fout | Set-Content -Path (Join-Path $xdir "funnel.log") -Encoding UTF8
+
       New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null
-      Write-Host "Tailscale + RDP ready."
+      Write-Host "Tailscale + RDP + Xray ready."
 
 build_script:
   - ps: |
@@ -88,10 +131,41 @@ build_script:
       $dns = ((& $exe status --json | ConvertFrom-Json).Self.DNSName).TrimEnd('.')
       $nl = [Environment]::NewLine
       $msg = "AppVeyor RDP UP$nl" + "Host: $dns$nl" + "IP: $ip$nl" + "User: $env:RDP_USER$nl" + "Pass: $env:RDP_PASSWORD$nl" + "Cycle: $env:RUN_MINUTES min, auto-restarts."
+
+      $xdir = Join-Path $env:MIGRATION "xray"
+      $uuid = if (Test-Path (Join-Path $xdir "uuid.txt")) { (Get-Content (Join-Path $xdir "uuid.txt") -Raw).Trim() } else { "" }
+      $wspath = if (Test-Path (Join-Path $xdir "wspath.txt")) { (Get-Content (Join-Path $xdir "wspath.txt") -Raw).Trim() } else { "" }
+      if ($uuid -and $wspath) {
+        $msg += "$nl$nl--- proxy (VLESS + WS + TLS) ---$nl" + "addr: $dns$nl" + "port: 443$nl" + "id: $uuid$nl" + "path: $wspath$nl" + "sni/host: $dns$nl" + "network: ws, tls: true"
+        @{ host = $dns; port = 443; id = $uuid; path = $wspath; sni = $dns; network = "ws"; tls = $true } | ConvertTo-Json | Set-Content -Path (Join-Path $env:MIGRATION "proxy.json") -Encoding UTF8
+      }
+
+      $fstat = (& $exe funnel status --json 2>&1 | Out-String)
+      if ($fstat -notmatch "8080") {
+        $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
+        Write-Host $fout
+        if ($fout -match "login\.tailscale\.com") { $msg += "$nl$nlFUNNEL APPROVAL NEEDED (open once):$nl$fout" }
+      }
+
       try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage" -Body @{ chat_id = $env:TELEGRAM_CHAT_ID; text = $msg } | Out-Null } catch {}
       Write-Host $msg
+
       $end = (Get-Date).AddMinutes([int]$env:RUN_MINUTES)
-      while ((Get-Date) -lt $end) { Start-Sleep -Seconds 30 }
+      $funnelLogged = $false
+      $i = 0
+      while ((Get-Date) -lt $end) {
+        if ($i % 4 -eq 0) {
+          $fstat = (& $exe funnel status --json 2>&1 | Out-String)
+          if ($fstat -match "8080") {
+            if (-not $funnelLogged) { Write-Host "Funnel active: https://$dns"; $funnelLogged = $true }
+          } else {
+            $fout = (& $exe funnel --bg --yes --https=443 localhost:8080 2>&1 | Out-String)
+            if ($fout.Trim()) { Write-Host $fout }
+          }
+        }
+        $i++
+        Start-Sleep -Seconds 30
+      }
       Write-Host "Run window ended."
 
 on_finish:
@@ -107,6 +181,9 @@ on_finish:
       New-Item -ItemType Directory -Force -Path "$stage\tailscale" | Out-Null
       Copy-Item "$env:MIGRATION\*" "$stage\migration" -Recurse -Force -ErrorAction SilentlyContinue
       Copy-Item "C:\ProgramData\Tailscale\*" "$stage\tailscale" -Recurse -Force -ErrorAction SilentlyContinue
+      # keep repo small: binaries are re-downloaded, only config/keys/UUID persist
+      Remove-Item "$stage\migration\xray\xray.exe" -Force -ErrorAction SilentlyContinue
+      Remove-Item "$stage\migration\xray\*.dat" -Force -ErrorAction SilentlyContinue
       $zip = Join-Path $env:TEMP "state.zip"
       Remove-Item $zip -Force -ErrorAction SilentlyContinue
       Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
@@ -116,6 +193,7 @@ on_finish:
       git clone "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $wd 2>&1 | Out-Host
       if (Test-Path (Join-Path $wd ".git")) {
         Copy-Item $zip (Join-Path $wd "state.zip") -Force
+        if (Test-Path (Join-Path $env:MIGRATION "proxy.json")) { Copy-Item (Join-Path $env:MIGRATION "proxy.json") (Join-Path $wd "proxy.json") -Force }
         git -C $wd config user.email "appveyor@users.noreply.github.com"
         git -C $wd config user.name "appveyor"
         git -C $wd add -A

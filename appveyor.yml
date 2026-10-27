@@ -164,6 +164,27 @@ install:
       $cfurl = ([regex]::Match($cftext, "https://[a-z0-9-]+\.trycloudflare\.com")).Value
       if ($cfurl) { Write-Host "Cloudflare tunnel: $cfurl" } else { Write-Host "Cloudflare tunnel URL not found yet (see $cflog)" }
 
+      # --- ngrok stable front door (free static dev domain) ---
+      if ($env:NGROK_AUTHTOKEN -and $env:NGROK_DOMAIN) {
+        $ngdir = Join-Path $env:MIGRATION "ngrok"
+        New-Item -ItemType Directory -Force -Path $ngdir | Out-Null
+        $ng = Join-Path $ngdir "ngrok.exe"
+        if (-not (Test-Path $ng)) {
+          Write-Host "Downloading ngrok..."
+          $ngzip = Join-Path $env:TEMP "ngrok.zip"
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $ngzip -UseBasicParsing
+          Expand-Archive -Path $ngzip -DestinationPath $ngdir -Force
+        }
+        if (-not (Test-Path $ng)) { throw "ngrok extract failed" }
+        try { Unblock-File -Path $ng -ErrorAction SilentlyContinue } catch {}
+        Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+        $nglog = Join-Path $ngdir "ngrok.log"
+        Start-Process -FilePath $ng -ArgumentList "http","8080","--authtoken=$env:NGROK_AUTHTOKEN","--domain=$env:NGROK_DOMAIN","--log=$nglog" -WorkingDirectory $ngdir -WindowStyle Hidden
+        Start-Sleep -Seconds 6
+        if (Test-Path $nglog) { Get-Content $nglog -Tail 6 | Out-Host }
+        Write-Host "ngrok front door: https://$env:NGROK_DOMAIN"
+      } else { Write-Host "ngrok not configured (NGROK_AUTHTOKEN/NGROK_DOMAIN empty)" }
+
       New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null
       Write-Host "Tailscale + RDP + Xray ready."
 
@@ -192,6 +213,10 @@ build_script:
           $cfhost = $cfurl -replace '^https://',''
           $info["cloudflare"] = @{ host = $cfhost; port = 443; id = $uuid; path = $wspath; sni = $cfhost; network = "ws"; tls = $true }
           $msg += "$nl$nl--- proxy (Cloudflare quick tunnel, URL rotates) ---$nl" + "addr: $cfhost$nl" + "port: 443$nl" + "id: $uuid$nl" + "path: $wspath$nl" + "sni/host: $cfhost$nl" + "network: ws, tls: true"
+        }
+        if ($env:NGROK_DOMAIN) {
+          $info["ngrok"] = @{ host = $env:NGROK_DOMAIN; port = 443; id = $uuid; path = $wspath; sni = $env:NGROK_DOMAIN; network = "ws"; tls = $true }
+          $msg += "$nl$nl--- proxy (ngrok, STABLE) ---$nl" + "addr: $env:NGROK_DOMAIN$nl" + "port: 443$nl" + "id: $uuid$nl" + "path: $wspath$nl" + "sni/host: $env:NGROK_DOMAIN$nl" + "network: ws, tls: true"
         }
         [System.IO.File]::WriteAllText((Join-Path $env:MIGRATION "proxy.json"), ($info | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
       }
@@ -253,6 +278,7 @@ on_finish:
       Remove-Item "$stage\migration\xray\xray.exe" -Force -ErrorAction SilentlyContinue
       Remove-Item "$stage\migration\xray\*.dat" -Force -ErrorAction SilentlyContinue
       Remove-Item "$stage\migration\cf\cloudflared.exe" -Force -ErrorAction SilentlyContinue
+      Remove-Item "$stage\migration\ngrok\ngrok.exe" -Force -ErrorAction SilentlyContinue
       $zip = Join-Path $env:TEMP "state.zip"
       Remove-Item $zip -Force -ErrorAction SilentlyContinue
       Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force

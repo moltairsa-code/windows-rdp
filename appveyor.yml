@@ -92,11 +92,15 @@ install:
       if (-not (Test-Path $xray)) { throw "Xray extract failed" }
 
       $uuidFile = Join-Path $xdir "uuid.txt"
-      if (-not (Test-Path $uuidFile)) { [guid]::NewGuid().ToString() | Set-Content -Path $uuidFile -Encoding ASCII }
-      $uuid = (Get-Content $uuidFile -Raw).Trim()
       $pathFile = Join-Path $xdir "wspath.txt"
-      if (-not (Test-Path $pathFile)) { ("/" + [guid]::NewGuid().ToString("N").Substring(0,12)) | Set-Content -Path $pathFile -Encoding ASCII }
-      $wspath = (Get-Content $pathFile -Raw).Trim()
+      if ([string]::IsNullOrWhiteSpace($env:PROXY_UUID)) {
+        if (-not (Test-Path $uuidFile)) { [guid]::NewGuid().ToString() | Set-Content -Path $uuidFile -Encoding ASCII }
+        $uuid = (Get-Content $uuidFile -Raw).Trim()
+      } else { $uuid = $env:PROXY_UUID; $uuid | Set-Content -Path $uuidFile -Encoding ASCII }
+      if ([string]::IsNullOrWhiteSpace($env:PROXY_PATH)) {
+        if (-not (Test-Path $pathFile)) { ("/" + [guid]::NewGuid().ToString("N").Substring(0,12)) | Set-Content -Path $pathFile -Encoding ASCII }
+        $wspath = (Get-Content $pathFile -Raw).Trim()
+      } else { $wspath = $env:PROXY_PATH; $wspath | Set-Content -Path $pathFile -Encoding ASCII }
 
       $cfg = [ordered]@{
         log = @{ loglevel = "warning" }
@@ -141,6 +145,25 @@ install:
       Write-Host $ftext
       $ftext | Set-Content -Path (Join-Path $xdir "funnel.log") -Encoding ASCII
 
+      # --- Cloudflare quick tunnel (public HTTPS+WS now; URL rotates per cycle until Funnel/ngrok) ---
+      $cfdir = Join-Path $env:MIGRATION "cf"
+      New-Item -ItemType Directory -Force -Path $cfdir | Out-Null
+      $cf = Join-Path $cfdir "cloudflared.exe"
+      if (-not (Test-Path $cf)) {
+        Write-Host "Downloading cloudflared..."
+        Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cf -UseBasicParsing
+      }
+      try { Unblock-File -Path $cf -ErrorAction SilentlyContinue } catch {}
+      Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+      $cflog = Join-Path $cfdir "cf.log"
+      $cferr = Join-Path $cfdir "cf.err.log"
+      Start-Process -FilePath $cf -ArgumentList "tunnel","--url","http://127.0.0.1:8080","--no-autoupdate" -WorkingDirectory $cfdir -WindowStyle Hidden -RedirectStandardOutput $cflog -RedirectStandardError $cferr
+      Start-Sleep -Seconds 12
+      $cftext = ""
+      foreach ($lf in @($cflog,$cferr)) { if (Test-Path $lf) { $cftext += (Get-Content $lf -Raw -ErrorAction SilentlyContinue) } }
+      $cfurl = ([regex]::Match($cftext, "https://[a-z0-9-]+\.trycloudflare\.com")).Value
+      if ($cfurl) { Write-Host "Cloudflare tunnel: $cfurl" } else { Write-Host "Cloudflare tunnel URL not found yet (see $cflog)" }
+
       New-Item -ItemType File -Force -Path $env:READY_FLAG | Out-Null
       Write-Host "Tailscale + RDP + Xray ready."
 
@@ -156,9 +179,21 @@ build_script:
       $xdir = Join-Path $env:MIGRATION "xray"
       $uuid = if (Test-Path (Join-Path $xdir "uuid.txt")) { (Get-Content (Join-Path $xdir "uuid.txt") -Raw).Trim() } else { "" }
       $wspath = if (Test-Path (Join-Path $xdir "wspath.txt")) { (Get-Content (Join-Path $xdir "wspath.txt") -Raw).Trim() } else { "" }
+      $cftext = ""
+      foreach ($lf in @((Join-Path $env:MIGRATION "cf\cf.log"),(Join-Path $env:MIGRATION "cf\cf.err.log"))) {
+        if (Test-Path $lf) { $cftext += (Get-Content $lf -Raw -ErrorAction SilentlyContinue) }
+      }
+      $cfurl = ([regex]::Match($cftext, "https://[a-z0-9-]+\.trycloudflare\.com")).Value
+
       if ($uuid -and $wspath) {
         $msg += "$nl$nl--- proxy (VLESS + WS + TLS) ---$nl" + "addr: $dns$nl" + "port: 443$nl" + "id: $uuid$nl" + "path: $wspath$nl" + "sni/host: $dns$nl" + "network: ws, tls: true"
-        @{ host = $dns; port = 443; id = $uuid; path = $wspath; sni = $dns; network = "ws"; tls = $true } | ConvertTo-Json | Set-Content -Path (Join-Path $env:MIGRATION "proxy.json") -Encoding UTF8
+        $info = @{ funnel = @{ host = $dns; port = 443; id = $uuid; path = $wspath; sni = $dns; network = "ws"; tls = $true } }
+        if ($cfurl) {
+          $cfhost = $cfurl -replace '^https://',''
+          $info["cloudflare"] = @{ host = $cfhost; port = 443; id = $uuid; path = $wspath; sni = $cfhost; network = "ws"; tls = $true }
+          $msg += "$nl$nl--- proxy (Cloudflare quick tunnel, URL rotates) ---$nl" + "addr: $cfhost$nl" + "port: 443$nl" + "id: $uuid$nl" + "path: $wspath$nl" + "sni/host: $cfhost$nl" + "network: ws, tls: true"
+        }
+        [System.IO.File]::WriteAllText((Join-Path $env:MIGRATION "proxy.json"), ($info | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
       }
 
       $fstat = (& $exe funnel status --json 2>&1 | Out-String)
@@ -217,6 +252,7 @@ on_finish:
       # keep repo small: binaries are re-downloaded, only config/keys/UUID persist
       Remove-Item "$stage\migration\xray\xray.exe" -Force -ErrorAction SilentlyContinue
       Remove-Item "$stage\migration\xray\*.dat" -Force -ErrorAction SilentlyContinue
+      Remove-Item "$stage\migration\cf\cloudflared.exe" -Force -ErrorAction SilentlyContinue
       $zip = Join-Path $env:TEMP "state.zip"
       Remove-Item $zip -Force -ErrorAction SilentlyContinue
       Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force

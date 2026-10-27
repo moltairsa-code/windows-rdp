@@ -31,7 +31,7 @@ jobs:
     env:
       RDP_USER: rdpuser
       TS_HOSTNAME: bullet
-      MIGRATION: C:\Migration
+      MIGRATION: D:\Migration
       STATE_REPO: moltairsa-code/rdp-state
 
     steps:

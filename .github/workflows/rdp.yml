@@ -97,6 +97,25 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Write-Host "RDP enabled for $u"
 
+      - name: Decrypt saved Chrome profile for next sign-in
+        env:
+          CHROME_PROFILE_KEY: ${{ secrets.CHROME_PROFILE_KEY }}
+        run: |
+          $archive = Join-Path $env:MIGRATION "chrome\profile.enc"
+          if (Test-Path $archive) {
+            $decrypt = Join-Path $env:GITHUB_WORKSPACE "decrypt-chrome-profile.ps1"
+            & $decrypt -ArchivePath $archive -StagingPath "C:\ProgramData\RunnerState" -TargetUser $env:RDP_USER -EncryptionKey $env:CHROME_PROFILE_KEY
+          } else {
+            Write-Host "No saved Chrome profile yet."
+          }
+
+      - name: Install Codex CLI
+        run: |
+          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw "Node.js/npm is not available on this runner." }
+          npm install --global @openai/codex
+          if ($LASTEXITCODE -ne 0) { throw "Codex CLI installation failed." }
+          Write-Host "Codex CLI installed; saved user state will restore at RDP sign-in."
+
       - name: Set up Chrome and run startup script
         run: |
           $setup = Join-Path $env:GITHUB_WORKSPACE "setup-chrome.ps1"
@@ -180,15 +199,16 @@ jobs:
         if: always()
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          CHROME_PROFILE_KEY: ${{ secrets.CHROME_PROFILE_KEY }}
         run: |
           $ErrorActionPreference = "Continue"
 
-          # Save reusable Chrome settings only; session credentials are excluded.
+          # Save Chrome, Codex, and Spotify user state in one encrypted archive.
           $chromeSave = Join-Path $env:GITHUB_WORKSPACE "save-chrome-profile.ps1"
           try {
-            & $chromeSave -MigrationPath $env:MIGRATION -ProfilePath "C:\Users\rdpuser\AppData\Local\Google\Chrome\User Data\Default"
+            & $chromeSave -MigrationPath $env:MIGRATION -ProfilePath "C:\Users\rdpuser\AppData\Local\Google\Chrome\User Data" -CodexPath "C:\Users\rdpuser\.codex" -SpotifyPath "C:\Users\rdpuser\AppData\Roaming\Spotify" -EncryptionKey $env:CHROME_PROFILE_KEY -CloseChrome
           } catch {
-            Write-Warning "Chrome settings snapshot failed: $_"
+            Write-Warning "Encrypted app state snapshot failed: $_"
           }
 
           $stage = Join-Path $env:RUNNER_TEMP "stage"

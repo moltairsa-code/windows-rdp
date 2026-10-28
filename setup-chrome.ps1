@@ -29,9 +29,10 @@ Copy-Item $restoreSource $restoreScript -Force
 $rdpUser = $env:RDP_USER
 if ([string]::IsNullOrWhiteSpace($rdpUser)) { $rdpUser = "rdpuser" }
 $account = "$env:COMPUTERNAME\$rdpUser"
-$taskName = "Restore Chrome settings for $rdpUser"
+$taskName = "Restore Chrome profile for $rdpUser"
 $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$restoreScript`" -MigrationPath `"$migration`""
+$chromeStage = Join-Path $env:ProgramData "RunnerState"
+$taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$restoreScript`" -SourceProfilePath `"$chromeStage`""
 $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $taskArgs
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
@@ -43,10 +44,10 @@ New-Item -ItemType Directory -Force -Path (Split-Path $spotifyScript) | Out-Null
 Copy-Item $spotifySource $spotifyScript -Force
 
 $spotifyTaskName = "Install Spotify and configure Spicetify for $rdpUser"
-$spotifyTaskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$spotifyScript`" -WaitForLoginSeconds 120"
+$spotifyTaskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$spotifyScript`" -WaitForLoginSeconds 120 -ProfileStatePath `"$env:ProgramData\RunnerState\Spotify`""
 $spotifyAction = New-ScheduledTaskAction -Execute $powershellExe -Argument $spotifyTaskArgs
 $spotifyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $account
 $spotifyPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $spotifyTaskName -Action $spotifyAction -Trigger $spotifyTrigger -Principal $spotifyPrincipal -Force | Out-Null
 
-Write-Host "Chrome settings will restore and Spotify/Spicetify will set up when $rdpUser signs in."
+Write-Host "Chrome profile restore and Spotify/Spicetify setup will run when $rdpUser signs in."

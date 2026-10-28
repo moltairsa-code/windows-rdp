@@ -1,5 +1,6 @@
 param(
-  [int]$WaitForLoginSeconds = 120
+  [int]$WaitForLoginSeconds = 120,
+  [string]$ProfileStatePath = "C:\ProgramData\RunnerState\Spotify"
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +58,18 @@ if (-not $spotifyExe) {
     $spotifyExe = $spotifyExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
   } until ($spotifyExe -or (Get-Date) -ge $deadline)
   if (-not $spotifyExe) { throw "Spotify installation failed with exit code $($install.ExitCode); Spotify.exe was not found." }
+}
+
+# Restore only Spotify's user profile after installing the fresh application.
+if (Test-Path $ProfileStatePath) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA "Spotify") | Out-Null
+  foreach ($name in @("Users", "prefs")) {
+    $source = Join-Path $ProfileStatePath $name
+    if (Test-Path $source) {
+      Copy-Item $source (Join-Path $env:APPDATA "Spotify") -Recurse -Force
+    }
+  }
+  Write-Host "Restored Spotify's saved user profile."
 }
 
 $spicetify = Get-Command spicetify -ErrorAction SilentlyContinue

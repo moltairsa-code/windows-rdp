@@ -58,6 +58,17 @@ jobs:
               Copy-Item (Join-Path $ex "tailscale\*") "C:\ProgramData\Tailscale" -Recurse -Force
               Write-Host "Tailscale identity restored."
             }
+            if (Test-Path (Join-Path $ex "codex")) {
+              $codexRunner = "C:\ProgramData\RunnerState\Codex"
+              New-Item -ItemType Directory -Force -Path $codexRunner | Out-Null
+              Copy-Item (Join-Path $ex "codex\*") $codexRunner -Recurse -Force
+              Write-Host "Codex state restored to RunnerState."
+              # Also copy to user profile if it exists
+              $codexUser = Join-Path $env:USERPROFILE ".codex"
+              New-Item -ItemType Directory -Force -Path $codexUser | Out-Null
+              Copy-Item (Join-Path $ex "codex\*") $codexUser -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Codex state restored to user profile."
+            }
           } else {
             Write-Host "No prior state - fresh machine."
           }
@@ -277,3 +288,4 @@ jobs:
             Write-Host "Dispatch failed (continuing): $_"
           }
           Write-Host "Next machine dispatch attempted."
+

@@ -37,4 +37,16 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
 
-Write-Host "Chrome is installed and reusable settings will restore when $rdpUser signs in."
+$spotifyScript = Join-Path $migration "spotify\setup-user.ps1"
+$spotifySource = Join-Path $PSScriptRoot "setup-spotify-user.ps1"
+New-Item -ItemType Directory -Force -Path (Split-Path $spotifyScript) | Out-Null
+Copy-Item $spotifySource $spotifyScript -Force
+
+$spotifyTaskName = "Install Spotify and configure Spicetify for $rdpUser"
+$spotifyTaskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$spotifyScript`" -WaitForLoginSeconds 120"
+$spotifyAction = New-ScheduledTaskAction -Execute $powershellExe -Argument $spotifyTaskArgs
+$spotifyTrigger = New-ScheduledTaskTrigger -AtLogOn -User $account
+$spotifyPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $spotifyTaskName -Action $spotifyAction -Trigger $spotifyTrigger -Principal $spotifyPrincipal -Force | Out-Null
+
+Write-Host "Chrome settings will restore and Spotify/Spicetify will set up when $rdpUser signs in."

@@ -25,8 +25,11 @@ $spotifyExe = $spotifyExeCandidates | Where-Object { Test-Path $_ } | Select-Obj
 
 if (-not $spotifyExe) {
   $installer = Join-Path $env:TEMP "SpotifyFullSetupX64.exe"
-  Write-Host "Downloading Spotify's official full desktop installer."
-  Invoke-WebRequest -Uri "https://download.scdn.co/SpotifyFullSetupX64.exe" -OutFile $installer -UseBasicParsing
+  Write-Host "Preparing Spotify's official full desktop installer."
+  if (-not (Test-Path $installer)) {
+    Write-Host "Downloading installer."
+    Invoke-WebRequest -Uri "https://download.scdn.co/SpotifyFullSetupX64.exe" -OutFile $installer -UseBasicParsing
+  }
   $signature = Get-AuthenticodeSignature $installer
   if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Spotify AB") {
     throw "Spotify installer signature validation failed."

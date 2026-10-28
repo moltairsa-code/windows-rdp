@@ -24,18 +24,21 @@ $spotifyExeCandidates = @(
 $spotifyExe = $spotifyExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $spotifyExe) {
-  $installer = Join-Path $env:TEMP "SpotifySetup.exe"
-  Write-Host "Downloading Spotify's desktop installer."
-  Invoke-WebRequest -Uri "https://download.scdn.co/SpotifySetup.exe" -OutFile $installer -UseBasicParsing
+  $installer = Join-Path $env:TEMP "SpotifyFullSetupX64.exe"
+  Write-Host "Downloading Spotify's official full desktop installer."
+  Invoke-WebRequest -Uri "https://download.scdn.co/SpotifyFullSetupX64.exe" -OutFile $installer -UseBasicParsing
+  $signature = Get-AuthenticodeSignature $installer
+  if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "Spotify AB") {
+    throw "Spotify installer signature validation failed."
+  }
   $install = Start-Process -FilePath $installer -ArgumentList "/silent /skip-app-launch" -Wait -PassThru
-  if ($install.ExitCode -ne 0) { throw "Spotify installation failed with exit code $($install.ExitCode)." }
 
   $deadline = (Get-Date).AddMinutes(2)
   do {
     Start-Sleep -Seconds 2
     $spotifyExe = $spotifyExeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
   } until ($spotifyExe -or (Get-Date) -ge $deadline)
-  if (-not $spotifyExe) { throw "Spotify's desktop installer completed, but Spotify.exe was not found." }
+  if (-not $spotifyExe) { throw "Spotify installation failed with exit code $($install.ExitCode); Spotify.exe was not found." }
 }
 
 $spicetify = Get-Command spicetify -ErrorAction SilentlyContinue

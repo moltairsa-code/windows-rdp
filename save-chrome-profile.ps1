@@ -79,7 +79,8 @@ try {
     $codexRoot = Join-Path $stagedProfile "Codex"
     New-Item -ItemType Directory -Force -Path $codexRoot | Out-Null
     Get-ChildItem $CodexPath -Force | Where-Object {
-      $_.Name -notin @("cache", "packages", "tmp", ".tmp", ".sandbox", ".sandbox-bin", ".sandbox-secrets", "logs")
+      $_.Name -notin @("cache", "packages", "tmp", ".tmp", ".sandbox", ".sandbox-bin", ".sandbox-secrets", "logs", "app-server-control", "app-server-daemon", "thread-writer-locks") -and
+      $_.Name -notmatch '\.(sock|lock)$'
     } | ForEach-Object { Copy-Item $_.FullName $codexRoot -Recurse -Force -ErrorAction Stop }
   }
 

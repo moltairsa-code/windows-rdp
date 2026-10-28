@@ -20,7 +20,12 @@ if (Test-Path $marker) {
   exit 0
 }
 
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+try {
+  Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction Stop
+} catch {
+  if ((Get-ExecutionPolicy) -ne "Bypass") { throw }
+  Write-Host "Execution policy is already bypassed for this setup process."
+}
 
 $storeSpotify = Get-AppxPackage -Name "SpotifyAB.SpotifyMusic" -ErrorAction SilentlyContinue
 if ($storeSpotify) {

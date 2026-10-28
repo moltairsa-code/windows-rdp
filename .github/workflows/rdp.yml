@@ -98,43 +98,67 @@ jobs:
           Write-Host "RDP enabled for $u"
 
       - name: Decrypt saved Chrome profile for next sign-in
+        continue-on-error: true
         env:
           CHROME_PROFILE_KEY: ${{ secrets.CHROME_PROFILE_KEY }}
         run: |
+          $ErrorActionPreference = "Continue"
           $archive = Join-Path $env:MIGRATION "chrome\profile.enc"
           if (Test-Path $archive) {
+            if ([string]::IsNullOrWhiteSpace($env:CHROME_PROFILE_KEY)) {
+              Write-Host "CHROME_PROFILE_KEY not set; skipping profile decrypt."
+              exit 0
+            }
             $decrypt = Join-Path $env:GITHUB_WORKSPACE "decrypt-chrome-profile.ps1"
-            & $decrypt -ArchivePath $archive -StagingPath "C:\ProgramData\RunnerState" -TargetUser $env:RDP_USER -EncryptionKey $env:CHROME_PROFILE_KEY
+            try {
+              & $decrypt -ArchivePath $archive -StagingPath "C:\ProgramData\RunnerState" -TargetUser $env:RDP_USER -EncryptionKey $env:CHROME_PROFILE_KEY
+              if ($LASTEXITCODE -ne 0) { Write-Host "Decrypt script exited with $LASTEXITCODE (continuing)"; exit 0 }
+            } catch {
+              Write-Host "Decrypt failed (continuing): $_"
+              exit 0
+            }
           } else {
             Write-Host "No saved Chrome profile yet."
           }
 
       - name: Install Codex CLI
+        continue-on-error: true
         run: |
-          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw "Node.js/npm is not available on this runner." }
+          $ErrorActionPreference = "Continue"
+          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Host "Node.js/npm not available; skipping Codex CLI install."; exit 0 }
           $codexInstall = "C:\Program Files\OpenAI\Codex"
-          npm install --global --prefix $codexInstall @openai/codex
-          if ($LASTEXITCODE -ne 0) { throw "Codex CLI installation failed." }
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if (($machinePath -split ';') -notcontains $codexInstall) {
-            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$codexInstall", "Machine")
+          try {
+            npm install --global --prefix $codexInstall @openai/codex 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Host "Codex CLI installation failed (continuing)"; exit 0 }
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            if (($machinePath -split ';') -notcontains $codexInstall) {
+              [Environment]::SetEnvironmentVariable("Path", "$machinePath;$codexInstall", "Machine")
+            }
+            $env:Path = "$codexInstall;$env:Path"
+            Write-Host "Codex CLI installed; saved user state will restore at RDP sign-in."
+          } catch {
+            Write-Host "Codex install error (continuing): $_"
           }
-          $env:Path = "$codexInstall;$env:Path"
-          Write-Host "Codex CLI installed; saved user state will restore at RDP sign-in."
 
       - name: Set up Chrome and run startup script
+        continue-on-error: true
         run: |
-          $setup = Join-Path $env:GITHUB_WORKSPACE "setup-chrome.ps1"
-          & $setup
+          $ErrorActionPreference = "Continue"
+          try {
+            $setup = Join-Path $env:GITHUB_WORKSPACE "setup-chrome.ps1"
+            if (Test-Path $setup) { & $setup 2>&1 | Out-Host } else { Write-Host "setup-chrome.ps1 not found" }
+          } catch { Write-Host "Chrome setup error (continuing): $_" }
 
-          $s = Join-Path $env:MIGRATION "startup.ps1"
-          if (Test-Path $s) {
-            Write-Host "Running Migration\startup.ps1 ..."
-            powershell -ExecutionPolicy Bypass -File $s
-            if ($LASTEXITCODE -ne 0) { throw "Migration\startup.ps1 failed with exit code $LASTEXITCODE" }
-          } else {
-            Write-Host "No startup.ps1 in Migration."
-          }
+          try {
+            $s = Join-Path $env:MIGRATION "startup.ps1"
+            if (Test-Path $s) {
+              Write-Host "Running Migration\startup.ps1 ..."
+              powershell -ExecutionPolicy Bypass -File $s 2>&1 | Out-Host
+              if ($LASTEXITCODE -ne 0) { Write-Host "Migration\startup.ps1 exited with $LASTEXITCODE (continuing)" }
+            } else {
+              Write-Host "No startup.ps1 in Migration."
+            }
+          } catch { Write-Host "startup.ps1 error (continuing): $_" }
 
       - name: Notify Telegram + keep alive + countdown
         env:
@@ -241,8 +265,15 @@ jobs:
 
       - name: Trigger next machine (loop)
         if: ${{ always() && inputs.test_mode != true }}
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          gh workflow run rdp.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f runtime_minutes="${{ inputs.runtime_minutes }}" -f test_mode=false
-          Write-Host "Next machine dispatched."
+          $ErrorActionPreference = "Continue"
+          try {
+            gh workflow run rdp.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f runtime_minutes="${{ inputs.runtime_minutes }}" -f test_mode=false 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Host "gh dispatch exited with $LASTEXITCODE (workflow may be disabled or API issue) - continuing" }
+          } catch {
+            Write-Host "Dispatch failed (continuing): $_"
+          }
+          Write-Host "Next machine dispatch attempted."

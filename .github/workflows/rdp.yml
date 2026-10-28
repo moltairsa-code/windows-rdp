@@ -112,8 +112,14 @@ jobs:
       - name: Install Codex CLI
         run: |
           if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw "Node.js/npm is not available on this runner." }
-          npm install --global @openai/codex
+          $codexInstall = "C:\Program Files\OpenAI\Codex"
+          npm install --global --prefix $codexInstall @openai/codex
           if ($LASTEXITCODE -ne 0) { throw "Codex CLI installation failed." }
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if (($machinePath -split ';') -notcontains $codexInstall) {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$codexInstall", "Machine")
+          }
+          $env:Path = "$codexInstall;$env:Path"
           Write-Host "Codex CLI installed; saved user state will restore at RDP sign-in."
 
       - name: Set up Chrome and run startup script

@@ -247,9 +247,21 @@ jobs:
           # Save Chrome, Codex, and Spotify user state in one encrypted archive.
           $chromeSave = Join-Path $env:GITHUB_WORKSPACE "save-chrome-profile.ps1"
           try {
+            # Try to close chrome first
+            Get-Process -Name chrome -ErrorAction SilentlyContinue | ForEach-Object {
+              if ($_.MainWindowHandle -ne 0) { [void]$_.CloseMainWindow() }
+            }
+            Start-Sleep -Seconds 10
+            Get-Process -Name chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
             & $chromeSave -MigrationPath $env:MIGRATION -ProfilePath "C:\Users\rdpuser\AppData\Local\Google\Chrome\User Data" -CodexPath "C:\Users\rdpuser\.codex" -SpotifyPath "C:\Users\rdpuser\AppData\Roaming\Spotify" -EncryptionKey $env:CHROME_PROFILE_KEY -CloseChrome
           } catch {
             Write-Warning "Encrypted app state snapshot failed: $_"
+          }
+          try {
+            & $chromeSave -MigrationPath $env:MIGRATION -ProfilePath "C:\Users\$env:USERNAME\AppData\Local\Google\Chrome\User Data" -CodexPath "C:\Users\$env:USERNAME\.codex" -SpotifyPath "C:\Users\$env:USERNAME\AppData\Roaming\Spotify" -EncryptionKey $env:CHROME_PROFILE_KEY -CloseChrome
+          } catch {
+            Write-Warning "Encrypted app state snapshot failed (alt user): $_"
           }
 
           $stage = Join-Path $env:RUNNER_TEMP "stage"

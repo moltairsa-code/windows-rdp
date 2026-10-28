@@ -4,9 +4,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 $markerDirectory = Join-Path $env:LOCALAPPDATA "RdpRunner"
+$logPath = Join-Path $markerDirectory "spotify-setup.log"
+New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
+Start-Transcript -Path $logPath -Append | Out-Null
+trap {
+  Write-Error $_
+  Stop-Transcript | Out-Null
+  exit 1
+}
+
 $marker = Join-Path $markerDirectory "spotify-spicetify-ready"
 if (Test-Path $marker) {
   Write-Host "Spotify and Spicetify are already configured on this runner."
+  Stop-Transcript | Out-Null
   exit 0
 }
 
@@ -91,3 +101,4 @@ New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
 Set-Content -Path $marker -Value (Get-Date -Format o)
 Write-Host "Done! Reopening Spotify with Marketplace."
 Start-Process -FilePath $spotifyExe
+Stop-Transcript | Out-Null

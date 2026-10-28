@@ -92,15 +92,38 @@ if (Get-Process -Name Spotify -ErrorAction SilentlyContinue) {
 }
 
 $marketplaceInstaller = Join-Path $env:TEMP "spm.ps1"
+
+# Set the theme first so Marketplace's installer does not pause for a local
+# theme replacement prompt when running unattended at logon.
+& $spicetifyExe config current_theme marketplace --bypass-admin
+if ($LASTEXITCODE -ne 0) { throw "Spicetify theme configuration failed with exit code $LASTEXITCODE." }
+
 Invoke-WebRequest -UseBasicParsing `
   "https://raw.githubusercontent.com/spicetify/spicetify-marketplace/main/resources/install.ps1" `
   -OutFile $marketplaceInstaller
 & $marketplaceInstaller -BypassAdmin
 
-& $spicetifyExe config current_theme marketplace --bypass-admin
-if ($LASTEXITCODE -ne 0) { throw "Spicetify theme configuration failed with exit code $LASTEXITCODE." }
+Write-Host "Closing Spotify before the final Spicetify apply."
+Get-Process -Name Spotify -ErrorAction SilentlyContinue | ForEach-Object {
+  if ($_.MainWindowHandle -ne 0) { [void]$_.CloseMainWindow() }
+}
+$closeDeadline = (Get-Date).AddSeconds(20)
+while ((Get-Process -Name Spotify -ErrorAction SilentlyContinue) -and (Get-Date) -lt $closeDeadline) {
+  Start-Sleep -Seconds 2
+}
+if (Get-Process -Name Spotify -ErrorAction SilentlyContinue) {
+  Stop-Process -Name Spotify -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 2
+}
+
+Write-Host "Applying the Marketplace theme."
 & $spicetifyExe backup apply --bypass-admin
-if ($LASTEXITCODE -ne 0) { throw "Spicetify backup/apply failed with exit code $LASTEXITCODE." }
+$backupApplyExitCode = $LASTEXITCODE
+if ($backupApplyExitCode -ne 0) {
+  Write-Host "Marketplace already created a backup; applying the configured Marketplace theme."
+  & $spicetifyExe apply --bypass-admin
+  if ($LASTEXITCODE -ne 0) { throw "Spicetify apply failed with exit code $LASTEXITCODE." }
+}
 
 New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
 Set-Content -Path $marker -Value (Get-Date -Format o)

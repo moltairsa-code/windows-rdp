@@ -181,11 +181,22 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           $ErrorActionPreference = "Continue"
-          function Tg($text) {
+          function Tg($text, $replyMarkup = $null) {
             try {
-              Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" `
-                -Body @{ chat_id = $env:TG_CHAT; text = $text } | Out-Null
+              $body = @{ chat_id = $env:TG_CHAT; text = $text }
+              if ($replyMarkup) { $body.reply_markup = ($replyMarkup | ConvertTo-Json -Compress) }
+              Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" -Body $body | Out-Null
             } catch { Write-Host "Tg failed: $_" }
+          }
+          function TgAnswer($callbackId, $text) {
+            try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/answerCallbackQuery" -Body @{ callback_query_id = $callbackId; text = $text } | Out-Null } catch {}
+          }
+          function TriggerRunner() {
+            try {
+              $payload = @{ ref = "${{ github.ref_name }}"; inputs = @{ runtime_minutes = "${{ inputs.runtime_minutes }}"; test_mode = "false" } } | ConvertTo-Json -Compress
+              Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp.yml/dispatches" -Headers @{ Authorization = "Bearer $env:GH_PAT"; Accept = "application/vnd.github+json" } -ContentType "application/json" -Body $payload | Out-Null
+              return $true
+            } catch { Write-Host "TriggerRunner failed: $_"; return $false }
           }
 
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
@@ -197,25 +208,15 @@ jobs:
           if ($runtime -gt 340) { $runtime = 340 }
           if ($runtime -lt 5) { $runtime = 330 }
 
-          $nl = [Environment]::NewLine
-          $msg = "RDP is UP and running$nl" +
-                 "Host: $dns$nl" +
-                 "IP:   $ip$nl" +
-                 "User: $env:RDP_USER$nl" +
-                 "Pass: $env:RDP_PASSWORD$nl" +
-                 "Runtime: $runtime min$nl" +
-                 "Files persist to C:\Migration across restarts."
-          Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" -Body @{ chat_id = $env:TG_CHAT; text = $msg } | Out-Null
-          Write-Host $msg
-
-          $end = (Get-Date).AddMinutes($runtime)
+          $start = Get-Date
+          $end = $start.AddMinutes($runtime)
 
           $wd = Join-Path $env:RUNNER_TEMP "status"
           Remove-Item $wd -Recurse -Force -ErrorAction SilentlyContinue
           git clone --depth 1 "https://x-access-token:$env:GH_PAT@github.com/$env:STATE_REPO.git" $wd 2>&1 | Out-Host
           if (Test-Path $wd) {
             $endEpoch = [int][double]::Parse((Get-Date -Date $end.ToUniversalTime() -UFormat %s))
-            @{ host = $dns; ip = $ip; user = $env:RDP_USER; started = (Get-Date).ToUniversalTime().ToString("o"); end_epoch = $endEpoch; runtime_min = $runtime } |
+            @{ host = $dns; ip = $ip; user = $env:RDP_USER; started = $start.ToUniversalTime().ToString("o"); end_epoch = $endEpoch; runtime_min = $runtime } |
               ConvertTo-Json | Set-Content (Join-Path $wd "alive.json")
             git -C $wd config user.email "github-actions[bot]@users.noreply.github.com"
             git -C $wd config user.name "github-actions[bot]"
@@ -226,15 +227,58 @@ jobs:
             Write-Host "alive.json published."
           }
 
-          $nextTick = (Get-Date).AddMinutes(60)
+          $offset = 0
+          $nextClock = $start.AddMinutes(60)
+          $nextStatus = $start
+          $statusId = $null
+          $buttons = @{ inline_keyboard = @(@(@{ text = "Status"; callback_data = "status" }, @{ text = "Start New Runner"; callback_data = "start_new" })) }
+
           while ((Get-Date) -lt $end) {
-            if ((Get-Date) -ge $nextTick) {
-              $left = [int][math]::Ceiling(($end - (Get-Date)).TotalMinutes)
+            $now = Get-Date
+            $left = [int][math]::Ceiling(($end - $now).TotalMinutes)
+            $elapsed = [int][math]::Floor(($now - $start).TotalMinutes)
+            $statusText = "RDP UP`nHost: $dns`nIP: $ip`nUser: $env:RDP_USER`nPass: $env:RDP_PASSWORD`nElapsed: $elapsed min`nLeft: $left min`nUse /status or buttons."
+
+            if ($now -ge $nextClock) {
               Tg "Clock: RDP box has $left min left"
-              $nextTick = (Get-Date).AddMinutes(60)
+              $nextClock = $now.AddMinutes(60)
             }
-            Start-Sleep -Seconds 60
+            if (-not $statusId) {
+              try {
+                $res = Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/sendMessage" -Body @{ chat_id = $env:TG_CHAT; text = $statusText; reply_markup = ($buttons | ConvertTo-Json -Compress) }
+                $statusId = $res.result.message_id
+              } catch { Write-Host "Initial status send failed: $_" }
+              $nextStatus = $now.AddMinutes(5)
+            } elseif ($now -ge $nextStatus) {
+              try { Invoke-RestMethod -Method Post -Uri "https://api.telegram.org/bot$env:TG_TOKEN/editMessageText" -Body @{ chat_id = $env:TG_CHAT; message_id = $statusId; text = $statusText; reply_markup = ($buttons | ConvertTo-Json -Compress) } | Out-Null } catch {}
+              $nextStatus = $now.AddMinutes(5)
+            }
+
+            try {
+              $u = Invoke-RestMethod -Method Get -Uri "https://api.telegram.org/bot$env:TG_TOKEN/getUpdates?timeout=20&offset=$offset"
+              if ($u -and $u.ok) {
+                foreach ($upd in $u.result) {
+                  $offset = [long]$upd.update_id + 1
+                  if ($upd.callback_query) {
+                    $cb = $upd.callback_query
+                    $data = $cb.data
+                    if ($data -eq "status") {
+                      TgAnswer $cb.id "Status: $left min left"
+                      Tg $statusText $buttons
+                    } elseif ($data -eq "start_new") {
+                      $ok = TriggerRunner
+                      if ($ok) { TgAnswer $cb.id "Starting new runner..." } else { TgAnswer $cb.id "Failed to start runner" }
+                    } else { TgAnswer $cb.id "Unknown" }
+                  } elseif ($upd.message -and $upd.message.text) {
+                    $txt = ($upd.message.text -split '\s+')[0].ToLower()
+                    if ($txt -eq "/status") { Tg $statusText $buttons }
+                    elseif ($txt -eq "/start") { if (TriggerRunner) { Tg "New runner dispatched." } else { Tg "Failed to dispatch new runner." } }
+                  }
+                }
+              }
+            } catch { Write-Host "Update poll failed: $_"; Start-Sleep -Seconds 5 }
           }
+          Tg "This RDP session is ending now. Next runner should start shortly if loop is enabled."
 
       - name: Save state (files + Tailscale identity)
         if: always()
